@@ -1,53 +1,26 @@
-function main(Data)
-   -- Parse the HL7 message
-   local msg, msgType = hl7.parse{vmd='simple.vmd', data=Data}
-   
-   -- Get facility from MSH-4
-   local facility = tostring(msg.MSH[4][1])
-   
-   -- Determine routing destination
-   local destination = route_message(facility)
-   
-   --  Apply PII masking if going to non-prod
-   local outputData = Data
-	if destination ~= 'PRODUCTION' then
-      if string.find(Data, "PID|") then
-         msg = mask_pii(msg)
-         outputData = msg:S()
-      else
-         iguana.logInfo("PII masking: Skipped")
-      end
-   end
-   
-   -- Log the decision
-   iguana.logInfo("ROUTING: " .. (msgType or "UNKNOWN") .. " from [" .. facility .. "] --> " .. destination)
-   
-   -- Pass to next component
-   queue.push{data=outputData}
-end
-
 local ROUTING_TABLE = {
-   MAIN_HOSPITAL = "PRODUCTION",
-   LAB           = "PRODUCTION",
-   RADIOLOGY     = "PRODUCTION",
-   PHARMACY      = "PRODUCTION",
-   EMERGENCY     = "PRODUCTION",
-   CLINIC        = "PRODUCTION",
-   ICU           = "PRODUCTION",
-   SURGERY       = "PRODUCTION",
-   TEST_CLINIC   = "NON-PRODUCTION",
-   DEV_SYSTEM    = "NON-PRODUCTION",
-   UAT_ENV       = "NON-PRODUCTION",
-   TRAINING_LAB  = "NON-PRODUCTION",
-   SANDBOX       = "NON-PRODUCTION"
+   MAIN_HOSPITAL = "PROD",
+   LAB           = "PROD",
+   RADIOLOGY     = "PROD",
+   PHARMACY      = "PROD",
+   EMERGENCY     = "PROD",
+   CLINIC        = "PROD",
+   ICU           = "PROD",
+   SURGERY       = "PROD",
+
+   TEST_CLINIC   = "NONPROD",
+   DEV_SYSTEM    = "NONPROD",
+   UAT_ENV       = "NONPROD",
+   TRAINING_LAB  = "NONPROD",
+   SANDBOX       = "NONPROD"
 }
 
-function route_message(facility)
-   local f = string.upper(facility)
-   return ROUTING_TABLE[f] or "NON-PRODUCTION (default)"
+function RouteFacility(Facility)
+   local f = string.upper(Facility or "")
+   return ROUTING_TABLE[f] or "NONPROD"
 end
 
-function mask_pii(msg)
+function PIImask(msg)
    if not msg.PID then
       return msg
    end
@@ -90,4 +63,36 @@ function mask_pii(msg)
    end
       
    return msg
+end
+
+function main(Data)
+   local msg = hl7.parse{vmd='simple.vmd', data=Data}
+   local facility = tostring(msg.MSH[4][1] or "")
+   local route = RouteFacility(facility)
+
+   -- Resolve component IDs
+   local comps = iguana.components()
+   local prodId    = comps["Test Listener (Prod)"]
+   local nonProdId = comps["Test Listener (Nonprod)"]
+
+   if not prodId or not nonProdId then
+      error("HL7 Router cannot find listener components. Check names.")
+   end
+
+   local out = Data
+
+   if route == "NONPROD" and Data:find("PID|", 1, true) then
+      msg = PIImask(msg)
+      out = msg:S()
+      iguana.logInfo("ROUTER: NONPROD masking applied")
+   end
+
+   iguana.logInfo("ROUTER: FACILITY="..facility.." ROUTE="..route)
+
+   -- Targeted send
+   if route == "PROD" then
+      message.send{data=out, id=prodId}
+   else
+      message.send{data=out, id=nonProdId}
+   end
 end
